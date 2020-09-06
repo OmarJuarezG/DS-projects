@@ -1,0 +1,841 @@
+---
+title: "HR Analytics: Classification"
+author: "Omar Juarez"
+#date: "24 de julio de 2020"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: zenburn
+    df_print: paged
+    code_fold: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Project Overview
+
+The main objectives for this project are:
+
+- Uncover the factors that lead to employee attrition.
+- Build a model that can predict attrition based on certain features of the employee.
+
+The dataset for this project is available on Kaggle: [IBM HR Analytics Employee Attrition & Performance](https://www.kaggle.com/pavansubhasht/ibm-hr-analytics-attrition-dataset).
+
+For this analysis we have used the following packages:
+
+```{r, message=FALSE}
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(car)
+library(cowplot)
+library(gridExtra)
+library(corrplot)
+library(MASS)
+library(ROCR)
+library(ROSE)
+library(rpart)
+library(rpart.plot)
+```
+
+## Reading data and basic exploration
+
+
+```{r class.output='bg-primary'}
+# Reading files
+general_data_raw <- read.csv('D:/DS_PROJECTS/HR Analytics Case Study/datasets_42363_72602_general_data.csv', header = TRUE, sep = ',')
+
+survey_data_raw <- read.csv('D:/DS_PROJECTS/HR Analytics Case Study/datasets_42363_72602_employee_survey_data.csv',header = TRUE,sep = ',')
+
+manager_survey_data_raw <- read.csv('D:/DS_PROJECTS/HR Analytics Case Study/datasets_42363_72602_manager_survey_data.csv', header = TRUE, sep = ',')
+
+in_time_raw <- read.csv('D:/DS_PROJECTS/HR Analytics Case Study/in_time.csv', header = TRUE, sep = ',')
+
+out_time_raw <- read.csv('D:/DS_PROJECTS/HR Analytics Case Study/out_time.csv', header = TRUE, sep = ',')
+
+# Exploring the dataframes
+
+str(survey_data_raw)
+
+str(manager_survey_data_raw)
+
+str(general_data_raw)
+
+#str(in_time_raw)
+
+#str(out_time_raw)
+
+# Checking for missing values
+
+sapply(survey_data_raw, function(x) sum(is.na(x)))/nrow(survey_data_raw)*100
+sapply(manager_survey_data_raw, function(x) sum(is.na(x)))/nrow(manager_survey_data_raw)*100
+sapply(general_data_raw, function(x) sum(is.na(x)))/nrow(general_data_raw)*100
+```
+
+## Data treatment
+
+Since we have out_time and in_time we can compute the average working hours per employee. This might perhaps gives us some additional insight.
+
+```{r, class.output='bg-primary', warning=FALSE}
+
+in_time <- sapply(in_time_raw, function(x) as.POSIXlt(x, origin = '1970-01-01', '%y-%m-%d %H:%M:%S'))
+in_time <- as.data.frame(in_time)
+
+out_time <- sapply(out_time_raw, function(x) as.POSIXlt(x, origin = '1970-01-01', '%y-%m-%d %H:%M:%S'))
+out_time <- as.data.frame(out_time)
+
+# Removing the first column since there has no value in the data
+
+in_time <- in_time[,c(2:ncol(in_time))]
+
+out_time <- out_time[,c(2:ncol(out_time))]
+
+# Computing the difference between out_time and in_time
+
+hours_worked_raw <- out_time - in_time
+
+# We want to keep the records even if there was one employee that went to work
+
+hours_worked_raw <- hours_worked_raw[,colSums(is.na(hours_worked_raw)) < nrow(hours_worked_raw)]
+
+# Transforming the resuls to numeric so we can take the average
+
+hours_worked_raw <- sapply(hours_worked_raw, function(x) as.numeric(x))
+
+hours_worked_raw <- as.data.frame(hours_worked_raw)
+
+# Taking the average of working hours per employee
+AvrWorkHrs <- apply(hours_worked_raw, 1, mean, na.rm = TRUE) # 1 Is to indicate rows
+
+# Creating ID column so it can be merged with the rest of the datasets
+
+id_vector <- 1:nrow(hours_worked_raw)
+
+AverageWorkedHours <- data.frame(EmployeeID = id_vector, AvrWorkHrs = AvrWorkHrs)
+
+# Before merging we take a look if each observation is from a different employee
+
+setdiff(survey_data_raw$EmployeeID, manager_survey_data_raw$EmployeeID)
+setdiff(manager_survey_data_raw$EmployeeID, general_data_raw$EmployeeID)
+setdiff(general_data_raw$EmployeeID, AverageWorkedHours$EmployeeID)
+
+# Since all of them are complete we can merge them
+
+general_data_merged <- inner_join(general_data_raw,manager_survey_data_raw, by = 'EmployeeID') %>%
+  inner_join(., survey_data_raw, by = 'EmployeeID') %>%
+  inner_join(., AverageWorkedHours, by = 'EmployeeID')
+
+# Droping values that have the same value for all observations
+
+same_values <- nearZeroVar(general_data_merged, names = TRUE)
+general_data_merged <- general_data_merged %>%
+  dplyr::select(-c(c('EmployeeID', same_values)))
+```
+
+
+
+```{r, class.output='bg-primary'}
+
+# Now we check the structure of the new dataframe and the missing values. And evaluate if they are significant in terms of the total observations
+
+str(general_data_merged)
+
+sapply(general_data_merged, function(x) sum(is.na(x)))/nrow(general_data_merged)*100
+
+# We have a very small proportion of missing values per feature. We translate those in terms of observations
+
+flag_nulls <- ifelse(rowSums(is.na(general_data_merged)) == 0, 0, 1)
+sum(flag_nulls)/nrow(general_data_merged)*100 
+
+# Since missing values represent 2.5% of the observations we remove them (just for this case, one should be careful when dropping missing values).
+
+general_data_merged <- general_data_merged[rowSums(is.na(general_data_merged)) == 0,]
+
+```
+
+## Exploratory Data Analysis (EDA)
+
+For this EDA we create two dataframes one with labels of the ordinal variables and the other just as it is.
+
+### Correlation plot
+
+```{r}
+
+# First we keep the numeric variables
+
+nums <- unlist(lapply(general_data_merged, is.numeric))
+general_data_merged_with_ordinal_values <- general_data_merged[, nums]
+
+# With this data we create a correlation matrix in order to see the relantionships between the features. Since the data contains ordinal data (hierarchy or ranks) we use Spearman correlation instead of Pearson.
+
+cor_matrix <- cor(general_data_merged_with_ordinal_values, method = 'spearman')
+corrplot(corr = cor_matrix, method = 'color', addCoef.col = 'gray',tl.cex = 0.7, number.cex = 0.5)
+
+```
+
+
+```{r}
+
+# We create the second dataframe with the labels of the ordinal features
+
+general_data_merged_with_categories <- general_data_merged
+
+general_data_merged_with_categories$Education[which(general_data_merged_with_categories$Education == 1)] <- 'Below College'
+general_data_merged_with_categories$Education[which(general_data_merged_with_categories$Education == 2)] <- 'College'
+general_data_merged_with_categories$Education[which(general_data_merged_with_categories$Education == 3)] <- 'Bachelor'
+general_data_merged_with_categories$Education[which(general_data_merged_with_categories$Education == 4)] <- 'Master'
+general_data_merged_with_categories$Education[which(general_data_merged_with_categories$Education == 5)] <- 'Doctor'
+
+general_data_merged_with_categories$EnvironmentSatisfaction[which(general_data_merged_with_categories$EnvironmentSatisfaction == 1)] <- 'Low'
+general_data_merged_with_categories$EnvironmentSatisfaction[which(general_data_merged_with_categories$EnvironmentSatisfaction == 2)] <- 'Medium'
+general_data_merged_with_categories$EnvironmentSatisfaction[which(general_data_merged_with_categories$EnvironmentSatisfaction == 3)] <- 'High'
+general_data_merged_with_categories$EnvironmentSatisfaction[which(general_data_merged_with_categories$EnvironmentSatisfaction == 4)] <- 'Very High'
+
+general_data_merged_with_categories$JobInvolvement[which(general_data_merged_with_categories$JobInvolvement == 1)] <- 'Low'
+general_data_merged_with_categories$JobInvolvement[which(general_data_merged_with_categories$JobInvolvement == 2)] <- 'Medium'
+general_data_merged_with_categories$JobInvolvement[which(general_data_merged_with_categories$JobInvolvement == 3)] <- 'High'
+general_data_merged_with_categories$JobInvolvement[which(general_data_merged_with_categories$JobInvolvement == 4)] <- 'Very High'
+
+general_data_merged_with_categories$JobSatisfaction[which(general_data_merged_with_categories$JobSatisfaction == 1)] <- 'Low'
+general_data_merged_with_categories$JobSatisfaction[which(general_data_merged_with_categories$JobSatisfaction == 2)] <- 'Medium'
+general_data_merged_with_categories$JobSatisfaction[which(general_data_merged_with_categories$JobSatisfaction == 3)] <- 'High'
+general_data_merged_with_categories$JobSatisfaction[which(general_data_merged_with_categories$JobSatisfaction == 4)] <- 'Very High'
+
+general_data_merged_with_categories$PerformanceRating[which(general_data_merged_with_categories$PerformanceRating == 1)] <- 'Low'
+general_data_merged_with_categories$PerformanceRating[which(general_data_merged_with_categories$PerformanceRating == 2)] <- 'Good'
+general_data_merged_with_categories$PerformanceRating[which(general_data_merged_with_categories$PerformanceRating == 3)] <- 'Excellent'
+general_data_merged_with_categories$PerformanceRating[which(general_data_merged_with_categories$PerformanceRating == 4)] <- 'Outstanding'
+
+general_data_merged_with_categories$WorkLifeBalance[which(general_data_merged_with_categories$WorkLifeBalance == 1)] <- 'Bad'
+general_data_merged_with_categories$WorkLifeBalance[which(general_data_merged_with_categories$WorkLifeBalance == 2)] <- 'Good'
+general_data_merged_with_categories$WorkLifeBalance[which(general_data_merged_with_categories$WorkLifeBalance == 3)] <- 'Better'
+general_data_merged_with_categories$WorkLifeBalance[which(general_data_merged_with_categories$WorkLifeBalance == 4)] <- 'Best'
+
+```
+
+### Pivot tables
+
+```{r}
+
+general_data_merged_with_categories %>%
+  group_by(Gender, Education) %>%
+  summarize(Average_Income = mean(MonthlyIncome)) %>%
+  arrange(-Average_Income)
+
+general_data_merged_with_categories %>%
+  group_by(MaritalStatus, WorkLifeBalance) %>%
+  summarize(Average_Work = mean(AvrWorkHrs), Percent_employees = round(n()/nrow(general_data_merged_with_categories)*100,0)) %>%
+  arrange(-Percent_employees)
+
+
+
+```
+
+**Findings:**
+
+- It seems that female workers have a high income in comparison with men, except for the women who have a masters degree since they earn less on average than the men.
+
+- More than a half of the employees say they have a 'Better' work-life balance.
+
+### Bar and box plots
+
+#### First part
+
+```{r}
+
+# Creating some plots to see the rate of attrition by other variables such as Education, Environment Satisfaction, Job Involvement, Job satisfaction, Performance rating, work balance
+
+g1 <- ggplot(data = general_data_merged_with_categories, aes(x = factor(Attrition), group = Education)) +
+  geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat = 'count', position = 'stack') +
+  facet_grid(~Education) +
+  scale_y_continuous(labels = scales::percent) +
+  geom_text(aes(label = scales::percent(round((..prop..),2)), y = ..prop..), stat = 'count', vjust = -.2, size = 3) +
+  labs(y = 'Percent', x = 'Attrition', title = 'Attrition by Education', fill = 'Attrition')+
+  theme_light() +
+  theme(legend.position = 'none')
+
+g2 <- ggplot(data = general_data_merged_with_categories, aes(x = factor(Attrition), group = EnvironmentSatisfaction)) +
+  geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat = 'count', position = 'stack') +
+  facet_grid(~EnvironmentSatisfaction) +
+  scale_y_continuous(labels = scales::percent) +
+  geom_text(aes(label = scales::percent(round((..prop..),2)), y = ..prop..), stat = 'count', vjust = -.2, size = 3) +
+  labs(y = 'Percent', x = 'Attrition', title = 'Environment satisfaction vs Attrition', fill = 'Attrition')+
+  theme_light() +
+  theme(legend.position = 'none')
+
+g3 <- ggplot(data = general_data_merged_with_categories, aes(x = factor(Attrition), group = JobInvolvement)) +
+  geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat = 'count', position = 'stack') +
+  facet_grid(~JobInvolvement) +
+  scale_y_continuous(labels = scales::percent) +
+  geom_text(aes(label = scales::percent(round((..prop..),2)), y = ..prop..), stat = 'count', vjust = -.2, size = 3) +
+  labs(y = 'Percent', x = 'Attrition', title = 'Job involvement vs Attrition', fill = 'Attrition')+
+  theme_light() +
+  theme(legend.position = 'none')
+
+g4 <- ggplot(data = general_data_merged_with_categories, aes(x = factor(Attrition), group = JobSatisfaction)) +
+  geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat = 'count', position = 'stack') +
+  facet_grid(~JobSatisfaction) +
+  scale_y_continuous(labels = scales::percent) +
+  geom_text(aes(label = scales::percent(round((..prop..),2)), y = ..prop..), stat = 'count', vjust = -.2, size = 3) +
+  labs(y = 'Percent', x = 'Attrition', title = 'Job Satisfaction vs Attrition', fill = 'Attrition')+
+  theme_light() +
+  theme(legend.position = 'none')
+
+g5 <- ggplot(data = general_data_merged_with_categories, aes(x = factor(Attrition), group = PerformanceRating)) +
+  geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat = 'count', position = 'stack') +
+  facet_grid(~PerformanceRating) +
+  scale_y_continuous(labels = scales::percent) +
+  geom_text(aes(label = scales::percent(round((..prop..),2)), y = ..prop..), stat = 'count', vjust = -.2, size = 3) +
+  labs(y = 'Percent', x = 'Attrition', title = 'Performance Rating vs Attrition', fill = 'Attrition')+
+  theme_light() +
+  theme(legend.position = 'none')
+
+g6 <- ggplot(data = general_data_merged_with_categories, aes(x = factor(Attrition), group = WorkLifeBalance)) +
+  geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat = 'count', position = 'stack') +
+  facet_grid(~WorkLifeBalance) +
+  scale_y_continuous(labels = scales::percent) +
+  geom_text(aes(label = scales::percent(round((..prop..),2)), y = ..prop..), stat = 'count', vjust = -.2, size = 3) +
+  labs(y = 'Percent', x = 'Attrition', title = 'Work-life balance vs Attrition', fill = 'Attrition')+
+  theme_light()	+
+  theme(legend.position = 'none')
+
+plot_grid(g1,g2,g3,g4,g5,g6, nrow = 3)
+
+```
+
+**Findings:**
+
+- We can see that attrition comes most from people with college education, perhaps they're could be interns.
+
+- People that have a low environment satisfaction have a high rate of attrition.
+
+- People with low job involvement have a high rate of attrition.
+
+- People with low job satisfaction have a high rate of attrition.
+
+- People with low work-life balance have a high rate of attrition.
+
+- Performance rating does not have a significance difference in the level of attrition.
+
+#### Second part
+
+```{r}
+
+# Plots of Attrition vs Age, Average working hours, Monthly income, Gender, Marital status, and Department.
+
+g7 <-  ggplot(data = general_data_merged_with_categories, aes(x = factor(Attrition), y = Age, fill = Attrition)) +
+  geom_boxplot() +
+  xlab('')+
+  theme(legend.position = 'none')
+
+g8 <- ggplot(data = general_data_merged_with_categories, aes(x = factor(Attrition), y = AvrWorkHrs, fill = Attrition)) +
+  geom_boxplot()+
+  xlab('')+
+  theme(legend.position = 'none')
+
+g9 <- ggplot(data = general_data_merged_with_categories, aes(x = factor(Attrition), y = log(MonthlyIncome), fill = Attrition)) +
+  geom_boxplot()+
+  xlab('')+
+  ylab('Log of Monthly Income')+
+  theme(legend.position = 'none')
+
+g10 <- ggplot(data = general_data_merged_with_categories, aes(x = factor(Attrition), group = Gender)) +
+  geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat = 'count', position = 'stack') +
+  facet_grid(~Gender) +
+  scale_y_continuous(labels = scales::percent) +
+  geom_text(aes(label = scales::percent(round((..prop..),2)), y = ..prop..), stat = 'count', vjust = -.2, size = 3) +
+  labs(y = 'Percent', x = 'Attrition', title = 'Gender vs Attrition', fill = 'Attrition')+
+  theme_light()	+
+  theme(legend.position = 'none')
+
+g11 <- ggplot(data = general_data_merged_with_categories, aes(x = factor(Attrition), group = MaritalStatus)) +
+  geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat = 'count', position = 'stack') +
+  facet_grid(~MaritalStatus) +
+  scale_y_continuous(labels = scales::percent) +
+  geom_text(aes(label = scales::percent(round((..prop..),2)), y = ..prop..), stat = 'count', vjust = -.2, size = 3) +
+  labs(y = 'Percent', x = 'Attrition', title = 'Marital Status vs Attrition', fill = 'Attrition')+
+  theme_light()	+
+  theme(legend.position = 'none')
+
+g12 <- ggplot(data = general_data_merged_with_categories, aes(x = factor(Attrition), group = Department)) +
+  geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat = 'count', position = 'stack') +
+  facet_grid(~Department) +
+  scale_y_continuous(labels = scales::percent) +
+  geom_text(aes(label = scales::percent(round((..prop..),2)), y = ..prop..), stat = 'count', vjust = -.2, size = 3) +
+  labs(y = 'Percent', x = 'Attrition', title = 'Department vs Attrition', fill = 'Attrition')+
+  theme_light()	+
+  theme(legend.position = 'none')
+
+plot_grid(g7,g8,g9,g10,g11,g12, nrow = 3)
+
+```
+
+**Findings:**
+
+- Younger people have higher level of attrition than older people.
+
+- People that work more hours on average have a high rate of attrition.
+
+- It seems that income and gender are not relevant in the level of attrition.
+
+- People that are single have a higher rate of attrition than the ones that are married or divorced.
+
+- Human Resources have a higher rate of attrition than Research & Development and Sales departments.
+
+## Model building: Part 1
+
+We want to understand the most important factors that lead to employee attrition. For this we use logistic regression to uncover which factors are the most relevant. For this moment we do not want to predict. In the following part *Model building: Part 2* we split the data into training and test and predict the outcomes based on the best classification algorithm either logistic regression, decision trees or random forest.
+
+```{r, class.output='bg-primary'}
+
+# Based on the findings in EDA we compute the first model based relevant features.
+
+mod_a <- glm(formula = Attrition ~ Age+BusinessTravel+Department+DistanceFromHome+Education+
+               Gender+JobLevel+MaritalStatus+MonthlyIncome+NumCompaniesWorked+YearsAtCompany+
+               JobInvolvement+PerformanceRating+EnvironmentSatisfaction+JobSatisfaction+WorkLifeBalance+
+               AvrWorkHrs, data = general_data_merged, family = 'binomial')
+
+summary(mod_a)
+
+vif(mod = mod_a)
+
+```
+
+**Interpretation:**
+
+1. Coefficients: The coefficients evaluate the effect against 'Yes' i.e an employee leaving the company. Based on this we can say the following about the statistical significant features:
+
+  - Age(-): All things being equal, the older the people are, the less likely to leave the company.
+  
+  - BusinessTravel(+): All things being equal, people that travel frequently or rarely are more likely to leave the company than non-travel people.
+  
+  - Department(-): All things being equal, people that work in Research and Sales are less likely to leave the company.
+  
+  - MaritalStatus(+): All things being equal, people that are married or single are more likely to leave the company.
+  
+  - NumCompaniesWorked(+): All things being equal, people who have worked with more companies are more likely to leave the company.
+  
+  - YearsAtCompany(-): All things being equal, people with more years at the company are less likely to leave.
+  
+  - EnvironmentSatisfaction(-): All things being equal, people with more environment satisfaction are less likely to leave.
+  
+  - JobSatisfaction(-): All things being equal, people with more job satisfaction are less likely to leave.
+  
+  - WorkLifeBalance(-): All things being equal, people with more work-life balance are less likely to leave.
+  
+  - AvrWorkHrs(+): All things being equal, people with more hours worked are more likely to leave.
+
+2. Overall
+
+  - From these results, we can say that they're are align with the findings from the EDA.
+  
+  - The Variance Inflation Factor(VIF) tells us that there are no problems with multicollinearity.
+  
+  - We could also improve the first model by droping some variables based on the Akaike Information Criteria (AIC) using the step wise algorithm.
+
+```{r, class.output='bg-primary'}
+
+mod_b <- stepAIC(mod_a, direction = 'both', trace = FALSE)
+
+summary(mod_b)
+
+vif(mod = mod_b)
+
+```
+
+**Interpretation:**
+
+- In this case our model has reduced its features from 20 to 15.
+
+- The effects are the same as the prior model but now the new model has a lower AIC so in those terms this is a simpler and better model than the previous one.
+
+- There is also no problem with multicollinearity.
+
+**Model evaluation:**
+
+To evaluate our model we create a graph comparing the predicted probabilities against actual attrition.
+
+```{r}
+
+predicted_data <- data.frame(prob_of_attrition = mod_b$fitted.values, attrition = general_data_merged$Attrition)
+
+predicted_data <- predicted_data %>%
+  arrange(prob_of_attrition) %>%
+  mutate(rank = 1:nrow(predicted_data))
+
+ggplot(data = predicted_data, aes(x = rank, y = prob_of_attrition))+
+  geom_point(aes(color = attrition), alpha = 1, shape = 4, stroke = 2)+
+  labs(y = 'Predicted probability of attrition', x = 'Index', title = 'Probability of attrition vs Actual attrition')
+  
+```
+
+**Graph Interpretation:**
+
+- As we see our model is making a good job identifying attrition. The salmon color represents the people with low probability of attrition and did not leave the company while the turquoise represents the people that had a high probability of leaving and actually left.
+
+- However this model can't be used to predict anything since we are using all the data. We need to see how our model works with unseen data.
+
+## Model building: Part 2
+
+Now instead of just uncover the factors of attrition we want to make predictions on which employee will leave based on several characteristcs gather from the company. The steps we take are the following:
+
+1. We split the data into training and test datasets.
+
+2. We build three models: Logistic regression, decision trees and random forest and compare their results.
+
+3. Select the best model
+
+### Model 1: Logistic Regression
+
+```{r, class.output='bg-primary'}
+
+# Setting seed for reproducibilty
+
+set.seed(123)
+
+# Data split
+
+training.sample <- general_data_merged$Attrition %>%
+  createDataPartition(p = 0.8, list = FALSE)
+
+train.data <- general_data_merged[training.sample,]
+test.data <- general_data_merged[-training.sample,]
+
+mod_c <- glm(formula = Attrition ~ Age+BusinessTravel+Department+DistanceFromHome+Education+
+               Gender+JobLevel+MaritalStatus+log(MonthlyIncome)+NumCompaniesWorked+YearsAtCompany+
+               JobInvolvement+PerformanceRating+EnvironmentSatisfaction+JobSatisfaction+WorkLifeBalance+
+               AvrWorkHrs, data = train.data, family = 'binomial')
+
+mod_c_StepWise <- stepAIC(mod_c, direction = 'both', trace = FALSE)
+
+summary(mod_c_StepWise)
+
+p.training <- predict(mod_c_StepWise, train.data, type = 'response') # vector of probabilites from the training dataset
+
+p.training.attrition <- as.factor(ifelse(p.training > 0.5, 'Yes', 'No')) # transforming those probabilites into factors (Yes or No)
+
+# Obtaining the confusion matrix for this model in our training data
+
+confusionMatrix(p.training.attrition, train.data$Attrition)
+
+# Testing our results in the test dataset with threshold = 0.5
+
+p.test <- predict(mod_c_StepWise, test.data, type = 'response')
+p.test.attrition <- as.factor(ifelse(p.test > 0.5, 'Yes','No'))
+confusionMatrix(p.test.attrition, test.data$Attrition)
+```
+
+**Interpretation**
+
+- As we see, the results in our training dataset have an accuracy of 85% while in the test dataset gives us 84%. However if we take a look at the No Information Rate indicator this shows that based only in the distribution of our features we can predict correctly 83% of the time. This is, if we take a new data point and assign it to the most common set we will be correct 83% of the time.
+
+- Futhermore if we take a look at Sensitivity and Specificity we have values of 97% and 18% respectively. So if we want to predict people who might leave (Prediction = Yes and Reference = Yes) this is not a good model, since will only detect 18% of them (25/114+25).
+
+**Possible solutions**
+
+1. Selecting a different threshold: Right now our threshold is 0.5, we could reduce it to increase the specificity value.
+
+  - For finding this new value we can plot a ROC curve to tell us which is the most appropiate value to identify the most true positives. By selecting a new     treshold to improve specificity we are going to decrease our level of sensitivity because of the trade off between them.
+
+2. Since the data is clearly unbalanced towards the people who stayed we can balanced it by using oversampling.
+
+**Solution 1: Selecting a different threshold**
+
+```{r}
+
+# Selecting a different treshold based on ROC curve
+
+ROCR_prediction <- prediction(p.training, train.data$Attrition)
+ROCR_performance <- performance(ROCR_prediction, 'tpr', 'fpr')
+
+plot(ROCR_performance, colorize = TRUE, print.cutoffs.at = seq(0.1, by = 0.1))
+
+# Based on this we select the new threshold to be 0.2 and test our model again.
+```
+
+
+
+```{r, class.output='bg-primary'}
+# Evaluating in training dataset withe new threshold
+
+p.training <- predict(mod_c_StepWise, train.data, type = 'response')
+p.training.attrition <- as.factor(ifelse(p.training > 0.2, 'Yes', 'No'))
+confusionMatrix(p.training.attrition, train.data$Attrition)
+
+# Evaluating in test dataset
+
+p.test <- predict(mod_c_StepWise, test.data, type = 'response')
+p.test.attrition <-  as.factor(ifelse(p.test> 0.2, 'Yes', 'No'))
+
+confusionMatrix(p.test.attrition, test.data$Attrition)
+```
+
+**Results:**
+
+- With this new threshold our level of specificity increased from 20% to 67% in the training dataset and from 18% to 64% in the test dataset. So now our model is predicting better the people who might leave the company.
+
+**Solution 2: Oversampling**
+
+- Since the data is unbalanced and we do not want to loose any information of the mayority class we oversample the minority class and try again with logistic regression.
+
+- We also use the stepwise algorithm to decrease the number of features in the model.
+
+*Training dataset*
+
+```{r, class.output='bg-primary'}
+
+# Using oversampling in the training dataset
+over <- ovun.sample(formula = Attrition ~., data = train.data, method = 'over')$data
+
+table(over$Attrition) # now the data is balanced between No and Yes
+
+# Building the model
+
+balanced_model <- glm(formula = Attrition ~ Age+BusinessTravel+Department+DistanceFromHome+Education+
+               Gender+JobLevel+MaritalStatus+log(MonthlyIncome)+NumCompaniesWorked+YearsAtCompany+
+               JobInvolvement+PerformanceRating+EnvironmentSatisfaction+JobSatisfaction+WorkLifeBalance+
+               AvrWorkHrs, data = over, family = 'binomial')
+
+# Model output
+
+summary(balanced_model)
+
+# Step wise
+
+balanced_model_step_wise <- stepAIC(balanced_model, direction = 'both', trace = FALSE)
+
+# Step wise model output
+
+summary(balanced_model_step_wise)
+
+p.training <- predict(balanced_model_step_wise, train.data, type = 'response')
+
+p.training.attrition <- as.factor(ifelse(p.training > 0.5, 'Yes', 'No'))
+
+confusionMatrix(p.training.attrition, train.data$Attrition)
+
+```
+
+**Result:** As we can see our model has improved by doing oversampling. Also setting the threshold to 0.5 does a good job identifying which employee might leave the company in our training dataset. Now we test the result in our testing dataset
+
+*Testing dataset*
+
+```{r, class.output='bg-primary'}
+
+p.test <- predict(balanced_model_step_wise, test.data, type = 'response')
+
+p.test.attrition <- as.factor(ifelse(p.test > 0.5, 'Yes', 'No'))
+
+confusionMatrix(p.test.attrition, test.data$Attrition)
+
+```
+
+**Result:** Now the speceificity has increased to 66% in our testing set, this is result is almost the same to the result we obtained previously when we set our threshold to be 02.
+
+### Model 2: Decision Tree
+
+For the second model we create a decision tree to see if our results can improve.
+
+```{r, class.output='bg-primary'}
+
+# Setting seed for reproducibilty
+
+set.seed(123)
+
+# Data split
+
+training.sample <- general_data_merged$Attrition %>%
+  createDataPartition(p = 0.8, list = FALSE)
+
+train.data <- general_data_merged[training.sample,]
+test.data <- general_data_merged[-training.sample,]
+
+# Decision tree model
+
+model.tree <- rpart::rpart(formula = Attrition ~ Age+BusinessTravel+Department+DistanceFromHome+Education+
+                             Gender+JobLevel+MaritalStatus+MonthlyIncome+NumCompaniesWorked+YearsAtCompany+
+                             JobInvolvement+PerformanceRating+EnvironmentSatisfaction+JobSatisfaction+WorkLifeBalance+
+                             AvrWorkHrs, data = train.data, method = 'class')
+
+# Plotting decision tree
+rpart.plot::prp(model.tree)
+
+predict_tree <- predict(model.tree, test.data, type = 'class')
+
+confusionMatrix(predict_tree, test.data$Attrition)
+
+```
+
+**Findings**
+
+- Just comparing the result of the first logistic regression(before doing oversampling) we can see that in terms of specificity the decision tree does a better job identifying attrition (30% vs 27%).
+
+- However when the data is balanced by oversampling we see that logistic regression is a better model to predict attrition (66% vs 30%).
+
+*As we did in logistic regression we balanced the data by doing oversampling and test the decision tree again*
+
+**Decision tree with oversampling**
+
+```{r, class.output='bg-primary'}
+
+over <- ovun.sample(formula = Attrition ~., data = train.data, method = 'over')$data
+
+model.tree <- rpart::rpart(formula = Attrition ~ Age+BusinessTravel+Department+DistanceFromHome+Education+
+                             Gender+JobLevel+MaritalStatus+MonthlyIncome+NumCompaniesWorked+YearsAtCompany+
+                             JobInvolvement+PerformanceRating+EnvironmentSatisfaction+JobSatisfaction+WorkLifeBalance+
+                             AvrWorkHrs, data = over, method = 'class')
+
+# Plotting decision tree
+rpart.plot::prp(model.tree)
+
+predict_tree <- predict(model.tree, test.data, type = 'class')
+
+confusionMatrix(predict_tree, test.data$Attrition)
+
+```
+
+**Findings**
+
+- With balanced data the model has improved from 30% to 63% in our test dataset.
+- Overall oversampling the data has led to better results in logistic and decision tree models.
+
+### Model 3: Random Forest
+
+A priori we know that Random Forest works well with inbalaced data in comparison with logistic and decision trees. We take the same parameters or features as before and feed them into the Random Forest model and take a look at the results.
+
+```{r, class.output='bg-primary'}
+
+set.seed(123)
+
+partition <- createDataPartition(general_data_merged$Attrition, p = 0.8, list = FALSE)
+
+training <- general_data_merged[partition,]
+test <- general_data_merged[-partition,]
+
+# Random forest with cross-validation
+model_rf_1 <- randomForest::randomForest(Attrition ~ Age+BusinessTravel+Department+DistanceFromHome+Education+
+                             Gender+JobLevel+MaritalStatus+MonthlyIncome+NumCompaniesWorked+YearsAtCompany+
+                             JobInvolvement+PerformanceRating+EnvironmentSatisfaction+JobSatisfaction+WorkLifeBalance+
+                             AvrWorkHrs, data = training, trControl = trainControl(method = 'cv', 10))
+
+# Printing the model
+model_rf_1
+
+# Evaluation of the model with useen data
+p <- predict(model_rf_1, test, type = 'response')
+
+confusionMatrix(p, test$Attrition)
+
+```
+
+**Findings**
+
+- Random Forest is doing a pretty good job predicting attrition since it only misclasfied 6 out of 139 observations reaching a level of specificty of 95%.
+
+- The number of trees for this model is set by default to be 500.
+
+- We might want to decrease the number of trees based on the error rate. If we decrease the number of trees the time in computing the model should decrease as well.
+
+```{r}
+
+# Plotting error rate
+plot(model_rf_1, main = 'Error rate vs number of trees')
+
+```
+
+- Based on this 100 trees should be fine.
+
+- We can also defined the mtry(No. of variables tried at each split) to improve our model.
+
+```{r, class.output='bg-primary'}
+# Plotting mtry
+t <- randomForest::tuneRF(training[,-2], training[,2], stepFactor = 0.5, plot = TRUE, ntreeTry = 100, trace = TRUE, improve = 0.05)
+```
+
+- With our default model we had an OOB of 0.81% and based on the graph we can leave it there because we do not think there is going to be a significance improvement with the data we have.
+
+- Since we found the 100 trees should be fine instead of 500, we build our model with that amount of trees.
+
+```{r, class.output='bg-primary'}
+
+model_rf_2 <- randomForest::randomForest(Attrition ~ Age+BusinessTravel+Department+DistanceFromHome+Education+
+                                           Gender+JobLevel+MaritalStatus+MonthlyIncome+NumCompaniesWorked+YearsAtCompany+
+                                           JobInvolvement+PerformanceRating+EnvironmentSatisfaction+JobSatisfaction+WorkLifeBalance+
+                                           AvrWorkHrs, data = training, ntree = 100, trControl = trainControl(method = 'cv', 10))
+
+model_rf_2
+
+p <- predict(model_rf_2, test, type = 'response')
+
+confusionMatrix(p, test$Attrition)
+
+```
+
+- We also can take a look at the number of nodes by each tree
+
+```{r}
+
+hist(randomForest::treesize(model_rf_2), main = 'No. of nodes', xlab = '', col = 'forestgreen')
+
+```
+
+- The range of nodes goes from 250 to 300 for our 100 trees.
+
+- Also we can identify which set of features are the most important.
+
+```{r}
+
+# Plotting features based on importance
+randomForest::varImpPlot(model_rf_2, main = 'Feature Importance')
+
+```
+
+**Top 5 features**
+
+1. Average working hours
+2. Age
+3. Years at the company
+4. Monthly Income
+5. Distance from home
+
+*Partial dependency plot*
+
+```{r}
+
+randomForest::partialPlot(model_rf_2, training, AvrWorkHrs, 'Yes')
+
+# When the Average working hours is more than 7 it tends to predict Attrition ('Yes')
+
+randomForest::partialPlot(model_rf_2, training, Age, 'Yes')
+
+# In this case the model is confused. When is more than 40 it tends to predict 'Yes' but also when the range is less than 40. This could be because of the outliers.
+
+```
+
+### Conclusions
+
+1. First we construct a logistic regression to identify the most relevant features for attrition. We found that Age(-), BusinessTravel(+), Department(-), MaritalStatus(+), NumCompaniesWorked(+), YearsAtCompany(-), EnvironmentSatisfaction(-), JobSatisfaction(-), WorkLifeBalance(-) and AvrWorkHrs(+) are statistically significant. This model was using all the data since at first we were not interested in prediction.
+
+2. When we changed the problem to predict employee attrition we used 3 different models: Logistic regression, decision trees and random forest to test which of those model performed better with the data we had.
+
+3. First we build those model with the data as it is and changing the threshold level to increase specificity. After that we did some manipulation to balanced the data by oversampling the minority class. With this data manipulation the results were better for both the logistic regression and decision trees in terms of specificity (i.e attrition = 'Yes').
+
+4. For the random forest model we did not use oversampling since that model usually works better with unbalanced data. The results that we got outperformed the previous two models, reaching a level of specificity of 95% in the test data set.
+
+5. We also modify our random forest model by reducing the number of trees needed to construct the forest from 500 (default) to 100 based on the error rate for each tree without compromising our results. We decided not change the number of variables for each split since it did not add any value.
+
+6. Based on the results of the random forest analysis we can conclude that the top 5 features are: Average working hours, Age, Years at the company, Monthly Income and Distance from home. Those features could be important for the manager in order to reduce the level of attrition among employees.
+
+7. For this particular dataset, we conclude that the best model to use in order to predict attrition is random forest.
+
+### References
+
+- [Kaggle Notebook](https://www.kaggle.com/ezgitural/eda-and-glm)
+- [Statquest](https://statquest.org/)
+- [Dealing with unbalanced data](https://www.r-bloggers.com/dealing-with-unbalanced-data-in-machine-learning/)
+- Lectures from professor Bharatendra Rai in [Handling Class Imbalance Problem](https://www.youtube.com/watch?v=Ho2Klvzjegg), [ROC Curve and AUC](https://www.youtube.com/watch?v=ypO1DPEKYFo) and [Random Forest](https://www.youtube.com/watch?v=dJclNIN-TPo)
